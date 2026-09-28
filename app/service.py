@@ -90,6 +90,19 @@
   枚举引用的全部出现：恰好一次 -> found 并返回对应起止序号 / 偏移；
   零次 -> missing；多次 -> ambiguous（绝不任选一个位置）。
 
+稿件校稿对齐（align_script）不变式：
+- 对齐是纯只读计算：只读取 snapshot_items 中冻结的生效文本（字幕行），
+  快照表与定稿 / 更正原表均不被修改；
+- 输入 1~100 条有序非空稿件行，每行带 1~3 的本行最多合并字幕数；
+  匹配代价为稿件行与字幕块拼接文本（相邻字幕无分隔拼接）之间的
+  Unicode 码点编辑距离（Levenshtein）；
+- 动态规划求稿件行与字幕的全局最小代价顺序对齐：每行可匹配连续
+  1..max_subtitles 条同段字幕（中间不得有缺口 / 空洞，字幕不得跨块
+  复用），也可跳过稿件行或字幕；跳过代价为相应文本的码点数；
+- 总代价相同时依次按“跳过项更少 -> 合并字幕更少（Σ(k-1) 更小）->
+  匹配序号字典序更小”择优；返回逐行起止序号 / 距离及未匹配稿件行
+  下标与未匹配字幕序号。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -1740,6 +1753,386 @@ def _matches_in_segment(segment: list, quote: str, limit: int) -> list:
         )
         search_from = index + 1  # 每次只前进一步，重叠出现也被枚举
     return found
+
+
+# ---------- 稿件校稿对齐 ----------
+
+
+def align_script(snapshot_id: str, lines: list) -> dict:
+    """把稿件行与快照冻结字幕做全局最小代价顺序对齐（纯只读，不修改状态）。
+
+    lines 为 [{"text": ..., "max_subtitles": ...}, ...]（HTTP 层已校验
+    1~100 条、文本非空、max_subtitles∈1..3）。只读取快照中 kind=subtitle
+    的冻结生效文本，按序号升序枚举；每行可匹配同一连续段内（中间无缺口）
+    的 1..max_subtitles 条连续字幕，字幕块无分隔拼接；稿件行 / 字幕也可
+    跳过，跳过代价为各自文本码点数。全局最优的并列裁决依次为：跳过项数
+    更少、合并字幕数（Σ(k-1)）更少、匹配序号字典序更小。
+    """
+    with read_tx() as conn:
+        meta = _get_snapshot_meta(conn, snapshot_id)
+        channel, watermark = meta["channel"], meta["watermark"]
+        rows = conn.execute(
+            "SELECT seq, effective_text FROM snapshot_items "
+            "WHERE snapshot_id = ? AND kind = 'subtitle' ORDER BY seq",
+            (snapshot_id,),
+        ).fetchall()
+
+    sub_seqs = [row["seq"] for row in rows]
+    sub_texts = [row["effective_text"] for row in rows]
+    line_texts = [line["text"] for line in lines]
+    line_max_k = [line["max_subtitles"] for line in lines]
+
+    total_cost, _, backtrack = _script_alignment_dp(
+        line_texts, line_max_k, sub_seqs, sub_texts
+    )
+
+    # 回溯重建完整对齐：path 为按顺序的操作序列
+    #   ("match", line_index, start_index, end_index_inclusive, distance)
+    #   ("skip_line", line_index)
+    #   ("skip_sub", subtitle_index)
+    # DP 内的匹配序列 Trie 节点只用于构造期字典序裁决；明细与未匹配
+    # 列表统一从回溯路径派生，保证单一事实来源。
+    path = []
+    i, j = len(lines), len(sub_seqs)
+    while i > 0 or j > 0:
+        code = backtrack[i][j]
+        if code >= _BT_MATCH_BASE:
+            k = code - _BT_MATCH_BASE + 1
+            i -= 1
+            j -= k
+            text = "".join(sub_texts[j:j + k])
+            path.append(("match", i, j, j + k - 1,
+                         _codepoint_edit_distance(line_texts[i], text)))
+        elif code == _BT_SKIP_LINE:
+            i -= 1
+            path.append(("skip_line", i))
+        else:  # _BT_SKIP_SUB
+            j -= 1
+            path.append(("skip_sub", j))
+    path.reverse()
+
+    alignments = [
+        {
+            "index": idx,
+            "matched": False,
+            "start_seq": None,
+            "end_seq": None,
+            "subtitles": None,
+            "distance": None,
+        }
+        for idx in range(len(lines))
+    ]
+    unmatched_lines = []
+    unmatched_seqs = []
+    for op in path:
+        if op[0] == "match":
+            _, li, sj, ej, dist = op
+            alignments[li] = {
+                "index": li,
+                "matched": True,
+                "start_seq": sub_seqs[sj],
+                "end_seq": sub_seqs[ej],
+                "subtitles": ej - sj + 1,
+                "distance": dist,
+            }
+        elif op[0] == "skip_line":
+            unmatched_lines.append(op[1])
+        else:
+            unmatched_seqs.append(sub_seqs[op[1]])
+
+    return {
+        "snapshot_id": snapshot_id,
+        "channel": channel,
+        "watermark": watermark,
+        "total_cost": total_cost,
+        "alignments": alignments,
+        "unmatched_script_lines": unmatched_lines,
+        "unmatched_subtitle_seqs": unmatched_seqs,
+    }
+
+
+# 回溯码：0=跳过字幕，1=跳过稿件行，>=2 表示匹配 k=码值-_BT_MATCH_BASE+1 条
+_BT_SKIP_SUB = 0
+_BT_SKIP_LINE = 1
+_BT_MATCH_BASE = 2
+
+
+class _MatchSeqNode:
+    """匹配块序号对序列的持久化 Trie 节点（字典序并列裁决用）。
+
+    根节点 pair 为 None；每个匹配操作经 parent.children 取或建
+    (parent, (start_seq, end_seq)) 子节点。节点不可变，同一父节点的
+    相同子标签复用既有节点；子节点缓存挂在节点上，随行滚动自然回收。
+    """
+
+    __slots__ = ("parent", "pair", "depth", "children")
+
+    def __init__(self, parent: "_MatchSeqNode | None", pair):
+        self.parent = parent
+        self.pair = pair
+        self.depth = 0 if parent is None else parent.depth + 1
+        self.children = None  # 惰性创建：{pair: node}
+
+    def child(self, pair):
+        """取标签为 pair 的子节点，不存在则创建（同标签幂等复用）。"""
+        table = self.children
+        if table is None:
+            node = _MatchSeqNode(self, pair)
+            self.children = {pair: node}
+            return node
+        node = table.get(pair)
+        if node is None:
+            node = _MatchSeqNode(self, pair)
+            table[pair] = node
+        return node
+
+
+def _script_alignment_dp(line_texts, line_max_k, sub_seqs, sub_texts):
+    """稿件行 × 字幕顺序对齐的二维动态规划。
+
+    状态 (i, j)：前 i 条稿件行与字幕有序列表前 j 个位置（按字幕下标，
+    非快照序号）对齐完成。入边三种：
+      - 跳过字幕 j-1：代价 len(sub_texts[j-1])；
+      - 跳过稿件行 i-1：代价 len(line_texts[i-1])；
+      - 行 i-1 匹配字幕块 [j-k, j)：k∈1..max，块内序号连续（中间无
+        缺口 / 空洞），代价为行文本与块拼接文本的码点编辑距离。
+    单元按 (总代价, 跳过项数, 合并字幕数, 匹配序号字典序) 四元组取小。
+    返回 (终态总代价, 终态匹配序列 Trie 节点, 回溯码二维表)。
+    """
+    n, m = len(line_texts), len(sub_seqs)
+    sub_lens = [len(t) for t in sub_texts]
+    line_lens = [len(t) for t in line_texts]
+
+    # 预计算各起点最多 max(line_max_k) 条连续字幕的拼接文本；
+    # 序号不连续（中间有缺口）的块不存在，且更长的块必然同跨该缺口。
+    max_k_global = max(line_max_k)
+    joins = {}  # (start_index, k) -> 拼接文本，仅覆盖序号连续的块
+    for s in range(m):
+        buf = ""
+        for k in range(1, min(max_k_global, m - s) + 1):
+            if k > 1 and sub_seqs[s + k - 1] != sub_seqs[s + k - 2] + 1:
+                break
+            buf += sub_texts[s + k - 1]
+            joins[(s, k)] = buf
+
+    root = _MatchSeqNode(None, None)
+
+    # 单元四元组：(cost, skips, joins_count, node)；滚动两行 prev / cur
+    prev = [None] * (m + 1)
+    prev[0] = (0, 0, 0, root)
+    acc = 0
+    for j in range(1, m + 1):  # i = 0：只能逐条跳过字幕
+        acc += sub_lens[j - 1]
+        prev[j] = (acc, j, 0, root)
+
+    backtrack = [[_BT_SKIP_LINE] * (m + 1) for _ in range(n + 1)]
+    backtrack[0][0] = _BT_SKIP_SUB  # (0,0) 不会被回溯，占位即可
+    for j in range(1, m + 1):
+        backtrack[0][j] = _BT_SKIP_SUB
+
+    for i in range(1, n + 1):
+        li_text = line_texts[i - 1]
+        li_len = line_lens[i - 1]
+
+        # LCP 缓存按行重置：缓存的是“本行深度”节点对的最长公共前缀，
+        # 下一行节点深度变化后旧缓存不再适用。Trie 子节点表挂在节点上
+        # 全局复用（不同行相同路径前缀共享同一节点）。
+        lcp_cache = {}  # (id(a), id(b)) -> lcp_depth
+
+        def lex_cmp(a, b):
+            """匹配序列字典序：-1 a 小 / 0 相等 / 1 b 小（仅比较等长序列）。"""
+            if a is b:
+                return 0
+            key = (id(a), id(b))
+            depth = lcp_cache.get(key)
+            if depth is None:
+                depth = 0
+                ta, tb = a, b
+                while ta.pair is not None and ta.pair == tb.pair:
+                    depth += 1
+                    ta, tb = ta.parent, tb.parent
+                # 沿途祖先对的 LCP 恰递减 1，一并记录到分叉点为止
+                step = 0
+                da, db_node = a, b
+                while step < depth:
+                    lcp_cache[(id(da), id(db_node))] = depth - step
+                    da, db_node = da.parent, db_node.parent
+                    step += 1
+            if depth == a.depth:
+                return 0  # 完全相同
+            # 上溯 depth 层后到达第一个不同标签
+            ta, tb = a, b
+            for _ in range(depth):
+                ta, tb = ta.parent, tb.parent
+            return -1 if ta.pair < tb.pair else 1
+
+        def prefer(cand, best):
+            """cand 是否优于 best：先比代价三项，全并列才比匹配序号字典序。"""
+            if cand[0] != best[0]:
+                return cand[0] < best[0]
+            if cand[1] != best[1]:
+                return cand[1] < best[1]
+            if cand[2] != best[2]:
+                return cand[2] < best[2]
+            return lex_cmp(cand[3], best[3]) < 0
+
+        def append_better(pc, pair, best):
+            """比较“父序列 pc + 新块 pair”与 best 的字典序（不实体化节点）。
+
+            末端先比 pair，不同立即有结论；相同再沿父链复用 lex_cmp，
+            从而每个网格单元只为最终胜出者创建一个 Trie 节点。
+            """
+            bp = best[3].pair
+            if pair != bp:
+                return pair < bp
+            return lex_cmp(pc, best[3].parent) < 0
+
+        cur = [None] * (m + 1)
+        base = prev[0]  # j = 0：只能跳过稿件行
+        cur[0] = (
+            base[0] + li_len, base[1] + 1, base[2], base[3]
+        )
+        backtrack[i][0] = _BT_SKIP_LINE
+
+        for j in range(1, m + 1):
+            # 入边 1：跳过字幕 j-1
+            c = cur[j - 1]
+            best = (c[0] + sub_lens[j - 1], c[1] + 1, c[2], c[3])
+            best_code = _BT_SKIP_SUB
+
+            # 入边 2：跳过稿件行 i-1
+            c = prev[j]
+            cand = (c[0] + li_len, c[1] + 1, c[2], c[3])
+            if prefer(cand, best):
+                best, best_code = cand, _BT_SKIP_LINE
+
+            # 入边 3：行 i-1 匹配连续字幕块 [j-k, j)
+            max_k = min(line_max_k[i - 1], j)
+            for k in range(1, max_k + 1):
+                s = j - k
+                joined = joins.get((s, k))
+                if joined is None:
+                    break  # 块跨缺口；更长的 k 同样跨缺口
+                pc = prev[s]
+                # margin = 候选总代价追平当前最优所允许的最大距离：
+                # dist < margin 严格更优；dist == margin 同价但块匹配
+                # 的 skips 不增加，仍可能凭后续裁决胜出；dist > margin
+                # 严格更差，丢弃。故带状截断上界取 margin+1。
+                margin = best[0] - pc[0]
+                if margin < 0:
+                    continue
+                upper = margin + 1
+                if abs(len(joined) - li_len) >= upper:
+                    continue
+                dist = _codepoint_edit_distance(li_text, joined, upper=upper)
+                if dist > margin:
+                    continue
+                cost = pc[0] + dist
+                joins_count = pc[2] + (k - 1)
+                pair = (sub_seqs[s], sub_seqs[j - 1])
+                # 先比代价三项；全并列才做虚拟字典序比较，胜出才实体化
+                if (
+                    cost < best[0]
+                    or (
+                        cost == best[0]
+                        and (
+                            pc[1] < best[1]
+                            or (
+                                pc[1] == best[1]
+                                and (
+                                    joins_count < best[2]
+                                    or (
+                                        joins_count == best[2]
+                                        and append_better(pc[3], pair, best)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ):
+                    best = (cost, pc[1], joins_count, pc[3].child(pair))
+                    best_code = _BT_MATCH_BASE + k - 1
+
+            cur[j] = best
+            backtrack[i][j] = best_code
+        prev = cur
+
+    final = prev[m]
+    return final[0], final[3], backtrack
+
+
+def _codepoint_edit_distance(a: str, b: str, upper: "int | None" = None) -> int:
+    """两个字符串的 Unicode 码点 Levenshtein 编辑距离（增删改各代价 1）。
+
+    逐码点（Python str 元素）计算，不做任何归一化；空串距离为另一串
+    码点数。
+
+    upper 为调用方关心的截断上界：真实距离 < upper 时返回精确距离，
+    否则返回 upper（这些候选在调用处都会被丢弃或仅需知道“不更优”）。
+    优先使用 rapidfuzz 的 C 实现（score_cutoff=upper-1，其超过截断时
+    恰好返回 cutoff+1=upper，语义一致）；无该依赖时回退到带状 DP。
+    """
+    if upper is None:
+        return _rf_distance(a, b) if _HAS_RAPIDFUZZ else _banded_distance(a, b)
+    if _HAS_RAPIDFUZZ:
+        return _rf_distance(a, b, score_cutoff=upper - 1)
+    return _banded_distance(a, b, upper)
+
+
+try:  # 可选高性能依赖：rapidfuzz 提供 C 实现的逐码点 Levenshtein
+    from rapidfuzz.distance import Levenshtein as _Levenshtein
+
+    _HAS_RAPIDFUZZ = True
+
+    def _rf_distance(a: str, b: str, score_cutoff: "int | None" = None) -> int:
+        return _Levenshtein.distance(a, b, score_cutoff=score_cutoff)
+except ImportError:  # pragma: no cover - 取决于部署镜像是否安装 rapidfuzz
+    _HAS_RAPIDFUZZ = False
+
+
+def _banded_distance(a: str, b: str, upper: "int | None" = None) -> int:
+    """无 rapidfuzz 时的回退：带状滚动数组 Levenshtein，契约与主函数相同。
+
+    只计算 |i-j| < upper 的带状区域（带外格点必 ≥ upper），终值达
+    upper 即截断返回。
+    """
+    la, lb = len(a), len(b)
+    if upper is None:
+        upper = max(la, lb)
+    if la == 0:
+        return min(lb, upper)
+    if lb == 0:
+        return min(la, upper)
+    if abs(la - lb) >= upper:
+        return upper
+    INF = upper + 1
+    prev_row = [INF] * (lb + 1)
+    cur_row = [INF] * (lb + 1)
+    prev_row[0] = 0
+    for j in range(1, min(lb, upper - 1) + 1):
+        prev_row[j] = j
+    for i in range(1, la + 1):
+        cur_row[0] = i if i < upper else INF
+        ca = a[i - 1]
+        lo = max(1, i - (upper - 1))
+        hi = min(lb, i + (upper - 1))
+        if lo > 1:
+            cur_row[lo - 1] = INF
+        for j in range(lo, hi + 1):
+            up_left = prev_row[j - 1] + (0 if ca == b[j - 1] else 1)
+            up = prev_row[j] + 1
+            left = cur_row[j - 1] + 1
+            value = up_left
+            if up < value:
+                value = up
+            if left < value:
+                value = left
+            cur_row[j] = value
+        if hi < lb:
+            cur_row[hi + 1] = INF
+        prev_row, cur_row = cur_row, prev_row
+    result = prev_row[lb]
+    return upper if result >= upper else result
 
 
 # ---------- 命名消费者拉取游标 ----------

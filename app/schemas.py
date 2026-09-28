@@ -594,6 +594,64 @@ class QuoteMigrationResponse(BaseModel):
     )
 
 
+# ---------- 稿件校稿对齐 ----------
+
+
+class ScriptAlignmentLineIn(BaseModel):
+    text: str = Field(..., min_length=1, description="稿件行文本（有序、非空，按 Unicode 码点计长）")
+    max_subtitles: int = Field(
+        ..., ge=1, le=3, description="本行最多可匹配合并的连续字幕数（1~3）"
+    )
+
+    @field_validator("text")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class ScriptAlignmentIn(BaseModel):
+    lines: List[ScriptAlignmentLineIn] = Field(
+        ..., min_length=1, max_length=100, description="有序稿件行（1~100 条，按输入顺序对齐）"
+    )
+
+
+class ScriptAlignmentItem(BaseModel):
+    index: int = Field(..., description="稿件行在请求 lines 数组中的下标（从 0 起，按输入顺序）")
+    matched: bool = Field(..., description="true=本行匹配了连续字幕；false=本行被跳过（未匹配）")
+    start_seq: Optional[int] = Field(
+        None, description="匹配字幕块的起始快照序号（含）；未匹配时为 null"
+    )
+    end_seq: Optional[int] = Field(
+        None, description="匹配字幕块的结束快照序号（含）；未匹配时为 null"
+    )
+    subtitles: Optional[int] = Field(
+        None, description="本行实际合并的字幕数（1~max_subtitles）；未匹配时为 null"
+    )
+    distance: Optional[int] = Field(
+        None,
+        description="稿件行与所匹配字幕块拼接文本的 Unicode 码点编辑距离；未匹配时为 null",
+    )
+
+
+class ScriptAlignmentResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    watermark: int = Field(..., description="快照锁定的水位线（对齐只读取该快照冻结的字幕）")
+    total_cost: int = Field(..., description="全局最优对齐的总代价（码点编辑距离与跳过码点数之和）")
+    alignments: List[ScriptAlignmentItem] = Field(
+        ..., description="逐行对齐结果，顺序与请求 lines 数组一致（未匹配行各序号字段为 null）"
+    )
+    unmatched_script_lines: List[int] = Field(
+        ..., description="被跳过（未匹配）的稿件行下标列表（从 0 起，升序）"
+    )
+    unmatched_subtitle_seqs: List[int] = Field(
+        ..., description="被跳过（未匹配）的字幕快照序号列表（升序）"
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 
