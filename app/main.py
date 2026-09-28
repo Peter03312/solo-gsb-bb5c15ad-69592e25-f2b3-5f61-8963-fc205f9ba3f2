@@ -29,6 +29,8 @@ from .schemas import (
     QuoteMigrationIn,
     QuoteMigrationResponse,
     RedactionIn,
+    ScriptAlignmentIn,
+    ScriptAlignmentResponse,
     SnapshotCorrectionsResponse,
     SnapshotCreateIn,
     SnapshotDiffResponse,
@@ -51,8 +53,8 @@ app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
     "支持追加式更正、不可变发布快照、快照差异、快照敏感词遮盖、"
-    "剪辑字幕导出、快照字幕引用迁移与命名消费者拉取游标",
-    version="1.7.0",
+    "剪辑字幕导出、快照字幕引用迁移、校稿对齐与命名消费者拉取游标",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -384,8 +386,40 @@ def migrate_snapshot_quote(snapshot_id: str, body: QuoteMigrationIn) -> dict:
     )
 
 
-# ---------- 命名消费者拉取游标 ----------
+@app.post(
+    "/snapshots/{snapshot_id}/script-alignments",
+    response_model=ScriptAlignmentResponse,
+    responses={
+        404: {"description": "快照不存在", "model": ErrorResponse},
+        422: {
+            "description": (
+                "请求体校验失败：lines 条数不在 1~100、含空白行，或 "
+                "max_merged_subtitles 不在 1~3"
+            )
+        },
+    },
+)
+def align_snapshot_script(snapshot_id: str, body: ScriptAlignmentIn) -> dict:
+    """把有序稿件行与快照冻结的字幕做全局最小代价顺序对齐（只读）。
 
+    - 请求体含 1~100 条有序、非空（去除首尾空白后非空）稿件行 `lines`，
+      以及每条稿件行最多合并的连续字幕数 `max_merged_subtitles`（1~3）；
+    - 对齐只读取快照冻结的**生效文本**（与 `view=effective` 一致），
+      缺口不参与匹配；每行可匹配 1~max 条**序号连续**的字幕（不跨缺口、
+      不复用），稿件行与字幕也都可以跳过；
+    - 匹配代价为稿件行与字幕拼接文本（多条按序号无分隔拼接）的 **Unicode
+      码点 Levenshtein 编辑距离**；跳过代价为相应文本的码点数；
+    - 动态规划求全局最小总代价的顺序对齐；总代价相同时依次取跳过项更少、
+      合并字幕更少、匹配序号字典序更小的方案；
+    - 返回每行匹配的起止序号与距离（仅匹配行）、未匹配的稿件行下标与
+      字幕序号；快照不存在返回 404，参数非法返回 422。
+    """
+    return service.align_snapshot_script(
+        snapshot_id, body.lines, body.max_merged_subtitles
+    )
+
+
+# ---------- 命名消费者拉取游标 ----------
 
 @app.post(
     "/channels/{channel}/consumers/{consumer}/claims",

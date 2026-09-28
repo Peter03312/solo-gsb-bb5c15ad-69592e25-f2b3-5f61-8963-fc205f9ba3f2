@@ -594,6 +594,82 @@ class QuoteMigrationResponse(BaseModel):
     )
 
 
+# ---------- 校稿对齐 ----------
+
+
+class ScriptAlignmentIn(BaseModel):
+    lines: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description=(
+            "有序稿件行 1~100 条；按输入顺序参与对齐，每行去除首尾空白后"
+            "不得为空（空白行返回 422）"
+        ),
+    )
+    max_merged_subtitles: int = Field(
+        ...,
+        ge=1,
+        le=3,
+        description="每条稿件行最多合并的连续字幕数（1~3）",
+    )
+
+    @field_validator("lines")
+    @classmethod
+    def _strip_and_require_nonblank_lines(cls, v: List[str]) -> List[str]:
+        stripped = [line.strip() for line in v]
+        if any(not line for line in stripped):
+            raise ValueError("每条稿件行去除首尾空白后不得为空")
+        return stripped
+
+
+class ScriptAlignmentMatch(BaseModel):
+    line_index: int = Field(
+        ..., description="稿件行在请求 lines 数组中的下标（从 0 起，按输入顺序）"
+    )
+    start_seq: int = Field(..., description="匹配到的第一条字幕序号（含）")
+    end_seq: int = Field(
+        ...,
+        description="匹配到的最后一条字幕序号（含）；start_seq == end_seq 表示单条匹配",
+    )
+    distance: int = Field(
+        ...,
+        description=(
+            "稿件行与所匹配字幕（多条时按序号无分隔拼接）之间的 "
+            "Unicode 码点 Levenshtein 编辑距离"
+        ),
+    )
+
+
+class ScriptAlignmentResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    watermark: int = Field(..., description="快照锁定的水位线")
+    max_merged_subtitles: int = Field(
+        ..., description="实际生效的每行最多合并字幕数（回显请求值）"
+    )
+    total_cost: int = Field(
+        ...,
+        description=(
+            "全局最小总代价：全部匹配距离与全部跳过项（稿件行 / 字幕）"
+            "按各自文本码点数计的跳过代价之和"
+        ),
+    )
+    alignments: List[ScriptAlignmentMatch] = Field(
+        ...,
+        description=(
+            "发生匹配的稿件行结果，按稿件行下标（输入顺序）升序；"
+            "未匹配行不出现在此数组中"
+        ),
+    )
+    unmatched_lines: List[int] = Field(
+        ..., description="未匹配（被跳过）的稿件行下标（从 0 起），按下标升序"
+    )
+    unmatched_subtitle_seqs: List[int] = Field(
+        ..., description="未匹配（被跳过）的字幕序号（不含缺口），按序号升序"
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 

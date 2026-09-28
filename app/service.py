@@ -90,6 +90,19 @@
   枚举引用的全部出现：恰好一次 -> found 并返回对应起止序号 / 偏移；
   零次 -> missing；多次 -> ambiguous（绝不任选一个位置）。
 
+校稿对齐（align_snapshot_script）不变式：
+- 对齐是纯只读计算：只读取 snapshot_items 中快照冻结的生效文本
+  （effective_text），快照表与定稿 / 更正原表均不被修改；缺口行不
+  参与匹配（仅按序号占位用于连续性判定）；
+- 请求含 1~100 条有序、非空稿件行与每行最多合并字幕数（1~3）；每行
+  可匹配 1~max 条序号连续的字幕——不得跨过缺口、不得复用字幕；稿件行
+  与字幕均可整体跳过，跳过代价为相应文本的 Unicode 码点数；
+- 匹配代价为稿件行与字幕拼接文本（多条按序号无分隔拼接）的 Unicode
+  码点 Levenshtein 编辑距离；动态规划在「行 × 字幕」网格上求全局
+  最小总代价的顺序对齐；总代价相同时依次取跳过项更少、合并字幕更少、
+  匹配序号字典序更小（以 (稿件行下标, 起始序号, 结束序号) 序列按
+  字典序比较）的方案。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -107,6 +120,8 @@ import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
+
+from rapidfuzz.distance import Levenshtein
 
 from .db import read_tx, write_tx
 
@@ -1740,6 +1755,207 @@ def _matches_in_segment(segment: list, quote: str, limit: int) -> list:
         )
         search_from = index + 1  # 每次只前进一步，重叠出现也被枚举
     return found
+
+
+# ---------- 校稿对齐 ----------
+
+
+def align_snapshot_script(
+    snapshot_id: str, lines: list, max_merged: int
+) -> dict:
+    """把有序稿件行与快照冻结的字幕做全局最小代价顺序对齐（纯只读）。
+
+    只读取 snapshot_items 中冻结的生效文本（effective_text），快照表与
+    定稿 / 更正原表均不被修改；快照中的永久缺口不参与匹配（按序占位），
+    合并字幕不得跨过缺口。对齐与代价计算全部委托给 _align_script_texts。
+    """
+    with read_tx() as conn:
+        meta = _get_snapshot_meta(conn, snapshot_id)
+        rows = conn.execute(
+            """
+            SELECT seq, kind, effective_text
+            FROM snapshot_items
+            WHERE snapshot_id = ?
+            ORDER BY seq
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    # 字幕按序号升序；gap 行只用于判定“相邻”，不作为可匹配 / 可跳过字幕
+    subtitle_rows = [row for row in rows if row["kind"] == "subtitle"]
+    seqs = [row["seq"] for row in subtitle_rows]
+    texts = [row["effective_text"] for row in subtitle_rows]
+
+    result = _align_script_texts(lines, seqs, texts, max_merged)
+    return {
+        "snapshot_id": snapshot_id,
+        "channel": meta["channel"],
+        "watermark": meta["watermark"],
+        "max_merged_subtitles": max_merged,
+        "total_cost": result["total_cost"],
+        "alignments": result["alignments"],
+        "unmatched_lines": result["unmatched_lines"],
+        "unmatched_subtitle_seqs": result["unmatched_subtitle_seqs"],
+    }
+
+
+def _align_script_texts(
+    lines: list, seqs: list, texts: list, max_merged: int
+) -> dict:
+    """稿件行 lines 与字幕（seqs/texts 按序一一对应）的全局最小代价顺序对齐。
+
+    动态规划网格 dp[i][j]：已处理前 i 条稿件行、前 j 条字幕时的最优方案，
+    方案键为 (总代价, 跳过项总数, 合并字幕数, 匹配序号字典序)。合法转移：
+
+    - 跳过稿件行 i：代价 len(lines[i-1])（码点数），跳过项 +1；
+    - 跳过字幕 j：代价 len(texts[j-1])，跳过项 +1；
+    - 稿件行 i 匹配字幕 j-k+1..j（1 <= k <= max_merged）：该 k 条字幕必须
+      序号连续（中间无缺口），文本按序号无分隔拼接，代价为稿件行与拼接
+      文本的 Unicode 码点 Levenshtein 编辑距离；k >= 2 时合并字幕数按
+      (k - 1) 累计，字典序尾部追加 (行下标, start_seq, end_seq)。
+
+    总代价相同依次取跳过项更少、合并字幕更少、匹配序号字典序更小的方案；
+    匹配单调向右下，字幕天然不跨缺口（连续性校验）也不会被复用。
+    """
+    n, m = len(lines), len(texts)
+    line_lens = [len(line) for line in lines]
+    sub_lens = [len(text) for text in texts]
+    # adjacent[j]：第 j 条（0 基）字幕与其前一条字幕序号是否连续
+    adjacent = [False] * m
+    for j in range(1, m):
+        adjacent[j] = seqs[j] == seqs[j - 1] + 1
+
+    # 每格只保留最优方案键；pairs 仅在 (代价, 跳过项, 合并数) 打平时才
+    # 参与比较，字典序为匹配三元组 (稿件行下标, 起始字幕序号, 结束字幕
+    # 序号) 的序列：同格的候选方案匹配条数相同（跳过项与合并数相同则
+    # 匹配行数确定），故同格比较的是等长序列的字典序。
+    prev_keys = [None] * (m + 1)
+    curr_keys = [None] * (m + 1)
+    # 回溯边：每格一个字节编码（1=跳过稿件行，2=跳过字幕，3+k=匹配 k 条）
+    edges = bytearray((n + 1) * (m + 1))
+    base = (0, 0, 0)
+    prev_keys[0] = base + ((),)
+    for j in range(1, m + 1):
+        c = prev_keys[j - 1][0] + sub_lens[j - 1]
+        prev_keys[j] = (c, j, 0, ())
+        edges[j] = 2
+
+    for i in range(1, n + 1):
+        curr_keys[0] = None
+        # 第 0 列：只能一路跳过稿件行
+        c = prev_keys[0][0] + line_lens[i - 1]
+        skipped = i
+        curr_keys[0] = (c, skipped, 0, ())
+        edges[i * (m + 1)] = 1
+
+        for j in range(1, m + 1):
+            best = None
+            best_code = 0
+
+            # 候选 1：跳过稿件行 i（来自 dp[i-1][j]）
+            cand = prev_keys[j]
+            key1 = (
+                cand[0] + line_lens[i - 1],
+                cand[1] + 1,
+                cand[2],
+                cand[3],
+            )
+            best, best_code = key1, 1
+
+            # 候选 2：跳过字幕 j（来自 dp[i][j-1]）
+            cand = curr_keys[j - 1]
+            key2 = (
+                cand[0] + sub_lens[j - 1],
+                cand[1] + 1,
+                cand[2],
+                cand[3],
+            )
+            if key2 < best:
+                best, best_code = key2, 2
+
+            # 候选 3：稿件行 i 匹配 j-k+1..j 的连续字幕（k=1..max_merged）
+            # 代价是第一优先级，故只能用代价下界（文本长度差）预剪枝；
+            # 打平（含代价更低）时才算距离并用完整方案键比较。
+            joined_len = 0
+            for k in range(1, max_merged + 1):
+                jj = j - k
+                if jj < 0:
+                    break
+                if k > 1 and not adjacent[jj + 1]:
+                    break  # 再长的合并只会跨过同一缺口
+                joined_len += sub_lens[jj]
+                cand = prev_keys[jj]
+                cutoff = best[0] - cand[0]
+                if cutoff < 0:
+                    continue  # 基础代价已高于当前最优，匹配不可能翻案
+                lower_bound = abs(line_lens[i - 1] - joined_len)
+                if lower_bound > cutoff:
+                    continue
+                distance = Levenshtein.distance(
+                    lines[i - 1],
+                    "".join(texts[jj:j]),
+                    score_cutoff=cutoff,
+                )
+                if distance > cutoff:
+                    continue
+                key3 = (
+                    cand[0] + distance,
+                    cand[1],
+                    cand[2] + k - 1,
+                    cand[3] + ((i - 1, seqs[jj], seqs[j - 1]),),
+                )
+                if key3 < best:
+                    best, best_code = key3, 3 + k
+
+            curr_keys[j] = best
+            edges[i * (m + 1) + j] = best_code
+
+        prev_keys, curr_keys = curr_keys, prev_keys
+
+    final = prev_keys[m]
+    total_cost = final[0]
+
+    # 回溯重建匹配 / 跳过项
+    matched_line_indexes = set()
+    matched_subtitle_indexes = set()
+    alignments = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        code = edges[i * (m + 1) + j]
+        if code == 1:
+            i -= 1
+        elif code == 2:
+            j -= 1
+        else:
+            k = code - 3
+            start, end = j - k, j - 1
+            matched_line_indexes.add(i - 1)
+            for t in range(start, j):
+                matched_subtitle_indexes.add(t)
+            alignments.append(
+                {
+                    "line_index": i - 1,
+                    "start_seq": seqs[start],
+                    "end_seq": seqs[end],
+                    "distance": Levenshtein.distance(
+                        lines[i - 1], "".join(texts[start:j])
+                    ),
+                }
+            )
+            i -= 1
+            j -= k
+
+    alignments.sort(key=lambda item: item["line_index"])
+    unmatched_lines = [t for t in range(n) if t not in matched_line_indexes]
+    unmatched_subtitle_seqs = [
+        seqs[t] for t in range(m) if t not in matched_subtitle_indexes
+    ]
+    return {
+        "total_cost": total_cost,
+        "alignments": alignments,
+        "unmatched_lines": unmatched_lines,
+        "unmatched_subtitle_seqs": unmatched_subtitle_seqs,
+    }
 
 
 # ---------- 命名消费者拉取游标 ----------
